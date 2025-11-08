@@ -49,6 +49,15 @@
         <p class="hint">提示：按住图形可在画布中拖动</p>
       </div>
       <div v-else class="empty">点击画布中图形以编辑标签</div>
+      <div class="tips">
+        <h4>使用提示</h4>
+        <ul>
+          <li>按住 Shift，从一个图形拖拽到另一个图形以连线</li>
+          <li>点击连线或图形后，按 Delete/Backspace 删除</li>
+          <li>滚轮以鼠标为中心缩放；拖动空白区域可平移画布</li>
+          <li>点击“重置点位”恢复缩放与平移</li>
+        </ul>
+      </div>
     </aside>
   </div>
 </template>
@@ -66,20 +75,31 @@ type Shape = {
   size?: number;
   label: string;
 };
+type Edge = {
+  id: number;
+  from: number; // 起点图形 id
+  to: number; // 终点图形 id
+};
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const board = ref<HTMLElement | null>(null);
 const ctx = ref<CanvasRenderingContext2D | null>(null);
 const shapes = reactive<Shape[]>([]);
+const edges = reactive<Edge[]>([]);
 const selectedId = ref<number | null>(null);
+const selectedEdgeId = ref<number | null>(null);
 const dragging = ref(false);
 const dragOffset = ref({ dx: 0, dy: 0 });
 const scale = ref(1);
 const pan = ref({ x: 0, y: 0 });
 const panDragging = ref(false);
 const panDragStart = ref({ x: 0, y: 0, panX: 0, panY: 0 });
+const linkDragging = ref(false);
+const linkStartId = ref<number | null>(null);
+const linkPreview = ref<{ x: number; y: number } | null>(null);
 
 let nextId = 1;
+let nextEdgeId = 1;
 
 const selectedShape = computed<Shape | null>(
   () => shapes.find((s) => s.id === selectedId.value) ?? null,
@@ -97,6 +117,33 @@ function draw() {
   c.textAlign = "center";
   c.textBaseline = "middle";
   c.font = "14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+  // 先绘制连线（在图形下方）
+  for (const e of edges) {
+    const a = shapes.find((s) => s.id === e.from);
+    const b = shapes.find((s) => s.id === e.to);
+    if (!a || !b) continue;
+    c.beginPath();
+    c.moveTo(a.x, a.y);
+    c.lineTo(b.x, b.y);
+    c.strokeStyle = selectedEdgeId.value === e.id ? "#f59e0b" : "#9ca3af";
+    c.lineWidth = selectedEdgeId.value === e.id ? 3 : 2;
+    c.stroke();
+  }
+  // 连线预览（Shift+拖拽）
+  if (linkDragging.value && linkStartId.value != null && linkPreview.value) {
+    const a = shapes.find((s) => s.id === linkStartId.value);
+    if (a) {
+      c.save();
+      c.setLineDash([6, 6]);
+      c.beginPath();
+      c.moveTo(a.x, a.y);
+      c.lineTo(linkPreview.value.x, linkPreview.value.y);
+      c.strokeStyle = "#f59e0b";
+      c.lineWidth = 2;
+      c.stroke();
+      c.restore();
+    }
+  }
   for (const s of shapes) {
     switch (s.type) {
       case "circle":
@@ -155,6 +202,21 @@ function addShape(type: ShapeType, x: number, y: number) {
   }
   shapes.push(shape);
   selectedId.value = id;
+  selectedEdgeId.value = null;
+  draw();
+}
+
+function addEdge(from: number, to: number) {
+  if (from === to) return;
+  // 防止重复连线（无向去重）
+  const exists = edges.some(
+    (e) => (e.from === from && e.to === to) || (e.from === to && e.to === from),
+  );
+  if (exists) return;
+  const id = nextEdgeId++;
+  edges.push({ id, from, to });
+  selectedEdgeId.value = id;
+  selectedId.value = null;
   draw();
 }
 
@@ -178,6 +240,40 @@ function hitTest(x: number, y: number): Shape | null {
       default:
         break;
     }
+  }
+  return null;
+}
+
+function pointSegmentDistance(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+) {
+  const vx = bx - ax;
+  const vy = by - ay;
+  const wx = px - ax;
+  const wy = py - ay;
+  const len2 = vx * vx + vy * vy;
+  if (len2 === 0) return Math.hypot(px - ax, py - ay);
+  let t = (wx * vx + wy * vy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * vx;
+  const cy = ay + t * vy;
+  return Math.hypot(px - cx, py - cy);
+}
+
+function hitTestEdge(x: number, y: number): Edge | null {
+  const threshold = 6; // 世界坐标下的选择阈值
+  for (let i = edges.length - 1; i >= 0; i--) {
+    const e = edges[i];
+    const a = shapes.find((s) => s.id === e.from);
+    const b = shapes.find((s) => s.id === e.to);
+    if (!a || !b) continue;
+    const d = pointSegmentDistance(x, y, a.x, a.y, b.x, b.y);
+    if (d <= threshold) return e;
   }
   return null;
 }
@@ -209,13 +305,33 @@ function onMouseDown(e: MouseEvent) {
   const { x, y } = screenToWorld(getCanvasPos(e));
   const s = hitTest(x, y);
   if (s) {
+    if (e.shiftKey) {
+      // 启动连线拖拽
+      linkDragging.value = true;
+      linkStartId.value = s.id;
+      linkPreview.value = { x, y };
+      selectedId.value = s.id;
+      selectedEdgeId.value = null;
+      draw();
+      return;
+    }
     selectedId.value = s.id;
+    selectedEdgeId.value = null;
     dragging.value = true;
     dragOffset.value.dx = x - s.x;
     dragOffset.value.dy = y - s.y;
     draw();
   } else {
+    // 尝试命中连线
+    const edge = hitTestEdge(x, y);
+    if (edge) {
+      selectedEdgeId.value = edge.id;
+      selectedId.value = null;
+      draw();
+      return;
+    }
     selectedId.value = null;
+    selectedEdgeId.value = null;
     panDragging.value = true;
     panDragStart.value = {
       x: (e as MouseEvent).clientX,
@@ -227,6 +343,12 @@ function onMouseDown(e: MouseEvent) {
 }
 
 function onMouseMove(e: MouseEvent) {
+  if (linkDragging.value) {
+    const { x, y } = screenToWorld(getCanvasPos(e));
+    linkPreview.value = { x, y };
+    draw();
+    return;
+  }
   if (panDragging.value) {
     const dx = e.clientX - panDragStart.value.x;
     const dy = e.clientY - panDragStart.value.y;
@@ -247,6 +369,22 @@ function onMouseMove(e: MouseEvent) {
 function onMouseUp() {
   dragging.value = false;
   panDragging.value = false;
+  if (linkDragging.value) {
+    const pos = { x: 0, y: 0 };
+    // 使用上一次预览位置作为松手位置
+    if (linkPreview.value) {
+      pos.x = linkPreview.value.x;
+      pos.y = linkPreview.value.y;
+    }
+    const target = hitTest(pos.x, pos.y);
+    if (target && linkStartId.value != null && target.id !== linkStartId.value) {
+      addEdge(linkStartId.value, target.id);
+    }
+    linkDragging.value = false;
+    linkStartId.value = null;
+    linkPreview.value = null;
+    draw();
+  }
 }
 
 function onDragStart(type: ShapeType, e: DragEvent) {
@@ -287,13 +425,33 @@ function onKeyDown(e: KeyboardEvent) {
   ) {
     return;
   }
-  if (selectedId.value == null) return;
-  const idx = shapes.findIndex((s) => s.id === selectedId.value);
-  if (idx >= 0) {
-    shapes.splice(idx, 1);
-    selectedId.value = null;
-    dragging.value = false;
-    draw();
+  // 删除所选图形或连线
+  if (selectedId.value != null) {
+    const shapeId = selectedId.value;
+    const idx = shapes.findIndex((s) => s.id === shapeId);
+    if (idx >= 0) {
+      shapes.splice(idx, 1);
+      // 同时清理关联连线
+      for (let i = edges.length - 1; i >= 0; i--) {
+        if (edges[i].from === shapeId || edges[i].to === shapeId) {
+          edges.splice(i, 1);
+        }
+      }
+      selectedId.value = null;
+      selectedEdgeId.value = null;
+      dragging.value = false;
+      draw();
+    }
+    return;
+  }
+  if (selectedEdgeId.value != null) {
+    const eid = selectedEdgeId.value;
+    const ei = edges.findIndex((e) => e.id === eid);
+    if (ei >= 0) {
+      edges.splice(ei, 1);
+      selectedEdgeId.value = null;
+      draw();
+    }
   }
 }
 
@@ -409,5 +567,22 @@ onBeforeUnmount(() => {
 .empty {
   color: #6b7280;
   font-size: 13px;
+}
+.tips {
+  margin-top: 12px;
+  font-size: 12px;
+  color: #6b7280;
+}
+.tips h4 {
+  font-size: 13px;
+  margin: 0 0 6px 0;
+  color: #374151;
+}
+.tips ul {
+  margin: 0;
+  padding-left: 18px;
+}
+.tips li {
+  margin-bottom: 4px;
 }
 </style>
